@@ -4,6 +4,7 @@ import sys
 import uuid
 from pathlib import Path
 import hashlib
+import json
 import traceback
 import aiofiles
 import aiofiles.os
@@ -105,6 +106,74 @@ router = APIRouter()
 _INGESTION_ATTEMPT_ID_KEY = "_rag_ingestion_attempt_id"
 _INGESTION_ATTEMPT_STARTED_AT_NS_KEY = "_rag_ingestion_attempt_started_at_ns"
 _INGESTION_CHUNK_INDEX_KEY = "_rag_chunk_index"
+
+
+def _capacity_chunk_fingerprint(document: Document) -> str:
+    """Return a stable fingerprint without exposing document content."""
+    metadata = document.metadata or {}
+    stable_metadata = {
+        key: metadata.get(key)
+        for key in (
+            "file_id",
+            "digest",
+            "source",
+            "page",
+            _INGESTION_CHUNK_INDEX_KEY,
+            _INGESTION_ATTEMPT_ID_KEY,
+            _INGESTION_ATTEMPT_STARTED_AT_NS_KEY,
+        )
+        if key in metadata
+    }
+    payload = json.dumps(
+        {
+            "content": document.page_content,
+            "metadata": stable_metadata,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _build_capacity_usage(documents: List[Document]) -> dict:
+    """Build a deterministic, owner-scoped vector usage snapshot."""
+    chunks_by_file = {}
+    for document in documents:
+        file_id = (document.metadata or {}).get("file_id")
+        if not isinstance(file_id, str) or not file_id:
+            continue
+        chunks_by_file.setdefault(file_id, []).append(
+            _capacity_chunk_fingerprint(document)
+        )
+
+    indexes = []
+    for file_id in sorted(chunks_by_file):
+        chunk_fingerprints = sorted(chunks_by_file[file_id])
+        index_version = hashlib.sha256(
+            json.dumps(
+                {"file_id": file_id, "chunks": chunk_fingerprints},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        indexes.append(
+            {
+                "file_id": file_id,
+                "logical_units": len(chunk_fingerprints),
+                "version": index_version,
+            }
+        )
+
+    version = hashlib.sha256(
+        json.dumps(indexes, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return {
+        "logical_units": sum(index["logical_units"] for index in indexes),
+        "version": version,
+        "indexes": indexes,
+    }
 
 
 def _tag_documents_for_ingestion(documents: List[Document], file_id: str) -> str:
@@ -419,6 +488,36 @@ async def get_all_ids(request: Request, entity_id: str = None):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/capacity/usage")
+async def get_capacity_usage(request: Request, entity_id: str = None):
+    """Report vector usage for the authenticated owner scope.
+
+    Versions are opaque content fingerprints used by reconciliation to identify
+    a changed snapshot. The response never includes document content.
+    """
+    scope = resolve_scope(request, entity_id)
+    try:
+        if isinstance(vector_store, AsyncPgVector):
+            ids = await vector_store.get_all_ids(
+                owners=scope.owners, executor=request.app.state.thread_pool
+            )
+            documents = await vector_store.get_documents_by_ids(
+                ids, owners=scope.owners, executor=request.app.state.thread_pool
+            )
+        else:
+            ids = vector_store.get_all_ids(owners=scope.owners)
+            documents = vector_store.get_documents_by_ids(ids, owners=scope.owners)
+
+        return _build_capacity_usage(documents)
+    except Exception as e:
+        logger.error(
+            "Failed to get capacity usage | Error: %s | Traceback: %s",
+            str(e),
+            traceback.format_exc(),
+        )
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/health")
 async def health_check():
     try:
@@ -514,9 +613,12 @@ async def delete_documents(
         else:
             vector_store.delete_scoped(ids=document_ids, owners=scope.owners)
 
-        file_count = len(document_ids)
+        deleted_file_ids = list(dict.fromkeys(document_ids))
+        file_count = len(deleted_file_ids)
         return {
-            "message": f"Documents for {file_count} file{'s' if file_count > 1 else ''} deleted successfully"
+            "message": f"Documents for {file_count} file{'s' if file_count > 1 else ''} deleted successfully",
+            "deleted": True,
+            "deleted_file_ids": deleted_file_ids,
         }
     except HTTPException as http_exc:
         logger.error(
