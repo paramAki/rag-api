@@ -159,6 +159,78 @@ def test_delete_documents(auth_headers):
     assert response.status_code == 200
     json_data = response.json()
     assert "Documents for" in json_data["message"]
+    assert json_data["deleted"] is True
+    assert json_data["deleted_file_ids"] == ["testid1"]
+
+
+def test_capacity_usage_is_deterministic_and_grouped(auth_headers, monkeypatch):
+    from app.services.vector_store.async_pg_vector import AsyncPgVector
+
+    async def capacity_documents(self, ids, owners=None, executor=None):
+        assert owners == ("testuser",)
+        return [
+            Document(
+                page_content="second chunk",
+                metadata={"file_id": "file-b", "_rag_chunk_index": 1},
+            ),
+            Document(
+                page_content="first chunk",
+                metadata={"file_id": "file-a", "_rag_chunk_index": 0},
+            ),
+            Document(
+                page_content="third chunk",
+                metadata={"file_id": "file-b", "_rag_chunk_index": 0},
+            ),
+        ]
+
+    monkeypatch.setattr(AsyncPgVector, "get_documents_by_ids", capacity_documents)
+
+    first = client.get("/capacity/usage", headers=auth_headers)
+    second = client.get("/capacity/usage", headers=auth_headers)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json() == second.json()
+    assert first.json()["logical_units"] == 3
+    assert first.json()["indexes"] == [
+        {
+            "file_id": "file-a",
+            "logical_units": 1,
+            "version": first.json()["indexes"][0]["version"],
+        },
+        {
+            "file_id": "file-b",
+            "logical_units": 2,
+            "version": first.json()["indexes"][1]["version"],
+        },
+    ]
+    assert len(first.json()["version"]) == 64
+
+
+def test_capacity_usage_forwards_entity_scope(auth_headers, monkeypatch):
+    from app.services.vector_store.async_pg_vector import AsyncPgVector
+
+    async def scoped_ids(self, owners=None, executor=None):
+        assert owners == ("shared-course", "testuser")
+        return []
+
+    async def no_documents(self, ids, owners=None, executor=None):
+        assert owners == ("shared-course", "testuser")
+        return []
+
+    monkeypatch.setattr(AsyncPgVector, "get_all_ids", scoped_ids)
+    monkeypatch.setattr(AsyncPgVector, "get_documents_by_ids", no_documents)
+
+    response = client.get(
+        "/capacity/usage",
+        params={"entity_id": "shared-course"},
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["logical_units"] == 0
+    assert response.json()["indexes"] == []
+    assert len(response.json()["version"]) == 64
 
 
 def test_query_embeddings_by_file_id(auth_headers):

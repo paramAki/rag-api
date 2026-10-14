@@ -172,6 +172,17 @@ def test_ids_lists_only_the_callers_files(attacker_headers):
     assert AGENT_FILE not in response.json()
 
 
+def test_capacity_usage_counts_only_the_callers_chunks(attacker_headers):
+    response = client.get("/capacity/usage", headers=attacker_headers)
+
+    assert response.status_code == 200
+    assert response.json()["logical_units"] == 2
+    assert [index["file_id"] for index in response.json()["indexes"]] == [
+        ATTACKER_FILE,
+        SHARED_FILE,
+    ]
+
+
 def test_query_multiple_no_longer_returns_foreign_files(attacker_headers):
     """``/query_multiple`` performed no authorization at all: every file id the
     caller listed was searched and returned. Paired with ``GET /ids`` above,
